@@ -87,9 +87,9 @@ cmd_send() {
   load_config
   [ -n "$SSH_TARGET" ] || { notify "ezcpyssh" "Kein SSH-Ziel konfiguriert"; err "Kein SSH-Ziel. Erst: ezcpyssh setup"; return 1; }
 
-  local tmpd png tiff
+  local tmpd="" png tiff
+  trap 'rm -rf "${tmpd:-}"' EXIT
   tmpd="$(mktemp -d -t ezcpyssh)" || { err "mktemp fehlgeschlagen"; return 1; }
-  trap 'rm -rf "$tmpd"' RETURN
   png="$tmpd/clip.png"; tiff="$tmpd/clip.tiff"
 
   clip_to_file "$png" "PNGf" || true
