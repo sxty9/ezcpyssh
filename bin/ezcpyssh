@@ -154,7 +154,7 @@ render_lua() {
 
 ensure_init_include() {
   mkdir -p "$HS_DIR"
-  if [ -f "$HS_INIT" ] && grep -qF "$MARK_START" "$HS_INIT"; then return 0; fi
+  if [ -f "$HS_INIT" ] && grep -qF -- "$MARK_START" "$HS_INIT"; then return 0; fi
   [ -f "$HS_INIT" ] && cp "$HS_INIT" "$HS_INIT.bak.$(date +%s)"
   {
     printf '%s\n' "$MARK_START"
@@ -165,7 +165,7 @@ ensure_init_include() {
 
 remove_init_include() {
   [ -f "$HS_INIT" ] || return 0
-  grep -qF "$MARK_START" "$HS_INIT" || return 0
+  grep -qF -- "$MARK_START" "$HS_INIT" || return 0
   cp "$HS_INIT" "$HS_INIT.bak.$(date +%s)"
   sed -i '' "/$MARK_START/,/$MARK_END/d" "$HS_INIT"
 }
@@ -302,7 +302,7 @@ cmd_doctor() {
 
   if hammerspoon_installed; then ok "Hammerspoon installiert"; else err "Hammerspoon fehlt"; fails=$((fails+1)); fi
   if [ -f "$HS_LUA" ]; then ok "ezcpyssh.lua vorhanden"; else err "ezcpyssh.lua fehlt — ezcpyssh setup"; fails=$((fails+1)); fi
-  if [ -f "$HS_INIT" ] && grep -qF "$MARK_START" "$HS_INIT"; then ok "init.lua-Einbindung vorhanden"; else err "init.lua-Einbindung fehlt — ezcpyssh setup"; fails=$((fails+1)); fi
+  if [ -f "$HS_INIT" ] && grep -qF -- "$MARK_START" "$HS_INIT"; then ok "init.lua-Einbindung vorhanden"; else err "init.lua-Einbindung fehlt — ezcpyssh setup"; fails=$((fails+1)); fi
 
   case "$(hs_accessibility)" in
     true) ok "Accessibility-Freigabe aktiv" ;;
