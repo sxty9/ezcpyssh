@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# ezcpyssh — paste a Mac-clipboard image straight into a remote program (e.g. Claude Code)
+# over SSH. Uploads the clipboard image to your SSH server and pastes the remote path,
+# which the remote program reads as a local image. Trigger: a global hotkey (default ⌘⇧V)
+# via Hammerspoon. See: https://github.com/sxty9/ezcpyssh
+set -uo pipefail
+
+VERSION="0.1.0"
+
+# --- Pfade ----------------------------------------------------------------------------
+resolve_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+SELF_DIR="$(resolve_self_dir)"            # .../ezcpyssh/bin
+REPO_ROOT="$(dirname "$SELF_DIR")"        # .../ezcpyssh
+TEMPLATE="$REPO_ROOT/share/ezcpyssh.lua.tmpl"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ezcpyssh"
+CONFIG="$CONFIG_DIR/config"
+
+BIN_LINK="$HOME/.local/bin/ezcpyssh"
+HS_DIR="$HOME/.hammerspoon"
+HS_LUA="$HS_DIR/ezcpyssh.lua"
+HS_INIT="$HS_DIR/init.lua"
+HS_LOG="/tmp/ezcpyssh_hs.log"
+MARK_START="-- >>> ezcpyssh >>>"
+MARK_END="-- <<< ezcpyssh <<<"
+
+# --- Defaults -------------------------------------------------------------------------
+DEF_REMOTE_DIR='$HOME/.cache/ezcpyssh'     # $HOME bleibt literal -> remote-seitig expandiert
+DEF_HOTKEY="cmd,shift,v"
+DEF_AUTOPASTE=1
+DEF_TERMINALS="Terminal,iTerm2,Ghostty,kitty,WezTerm,Alacritty"
+
+# --- Ausgabe-Helfer -------------------------------------------------------------------
+if [ -t 1 ]; then C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'; else C_OK=; C_WARN=; C_ERR=; C_DIM=; C_RST=; fi
+ok()   { printf '%s✓%s %s\n'  "$C_OK"   "$C_RST" "$*"; }
+warn() { printf '%s!%s %s\n'  "$C_WARN" "$C_RST" "$*" >&2; }
+err()  { printf '%s✗%s %s\n'  "$C_ERR"  "$C_RST" "$*" >&2; }
+note() { printf '%s%s%s\n'    "$C_DIM"  "$*"     "$C_RST"; }
+notify() { osascript -e "display notification \"${2:-}\" with title \"${1:-ezcpyssh}\"" >/dev/null 2>&1 || true; }
+
+require_macos() { [ "$(uname -s)" = "Darwin" ] || { err "ezcpyssh läuft nur auf macOS."; exit 1; }; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+load_config() {
+  SSH_TARGET=""; REMOTE_DIR="$DEF_REMOTE_DIR"; HOTKEY="$DEF_HOTKEY"; AUTOPASTE="$DEF_AUTOPASTE"; TERMINAL_APPS="$DEF_TERMINALS"
+  # shellcheck disable=SC1090
+  [ -f "$CONFIG" ] && . "$CONFIG"
+  SSH_TARGET="${SSH_TARGET:-}"; REMOTE_DIR="${REMOTE_DIR:-$DEF_REMOTE_DIR}"
+  HOTKEY="${HOTKEY:-$DEF_HOTKEY}"; AUTOPASTE="${AUTOPASTE:-$DEF_AUTOPASTE}"; TERMINAL_APPS="${TERMINAL_APPS:-$DEF_TERMINALS}"
+}
+
+# =====================================================================================
+# send — Clipboard-Bild hochladen, Remote-Pfad ins Clipboard, optional einfügen
+# =====================================================================================
+clip_to_file() { # $1 outfile, $2 = PNGf|TIFF
+  osascript - "$1" "$2" >/dev/null 2>&1 <<'OSA'
+on run argv
+  set outPath to item 1 of argv
+  set klass to item 2 of argv
+  set d to missing value
+  try
+    if klass is "PNGf" then
+      set d to (the clipboard as «class PNGf»)
+    else
+      set d to (the clipboard as «class TIFF»)
+    end if
+  end try
+  if d is missing value then error "noimg"
+  set fh to open for access (POSIX file outPath) with write permission
+  set eof fh to 0
+  write d to fh
+  close access fh
+end run
+OSA
+}
+
+cmd_send() {
+  require_macos
+  load_config
+  [ -n "$SSH_TARGET" ] || { notify "ezcpyssh" "Kein SSH-Ziel konfiguriert"; err "Kein SSH-Ziel. Erst: ezcpyssh setup"; return 1; }
+
+  local tmpd png tiff
+  tmpd="$(mktemp -d -t ezcpyssh)" || { err "mktemp fehlgeschlagen"; return 1; }
+  trap 'rm -rf "$tmpd"' RETURN
+  png="$tmpd/clip.png"; tiff="$tmpd/clip.tiff"
+
+  clip_to_file "$png" "PNGf" || true
+  if [ ! -s "$png" ] && clip_to_file "$tiff" "TIFF"; then
+    sips -s format png "$tiff" --out "$png" >/dev/null 2>&1 || true
+  fi
+  if [ ! -s "$png" ]; then notify "ezcpyssh" "Kein Bild im Clipboard"; return 2; fi
+
+  local ts remote_cmd remote_path
+  ts="$(date +%Y%m%d_%H%M%S)"
+  remote_cmd="d=\"$REMOTE_DIR\"; mkdir -p \"\$d\"; f=\"\$d/clip_${ts}.png\"; cat > \"\$f\"; printf '%s' \"\$f\""
+  if ! remote_path="$(ssh -o ConnectTimeout=15 "$SSH_TARGET" "$remote_cmd" < "$png")" || [ -z "$remote_path" ]; then
+    notify "ezcpyssh" "Upload fehlgeschlagen"; return 1
+  fi
+
+  printf '%s' "$remote_path" | pbcopy
+
+  local autopaste="${EZCPYSSH_AUTOPASTE:-$AUTOPASTE}"
+  if [ "$autopaste" = "1" ]; then
+    sleep 0.2
+    osascript -e 'tell application "System Events" to keystroke "v" using command down' >/dev/null 2>&1 \
+      || notify "ezcpyssh" "Pfad im Clipboard – ⌘V zum Einfügen (Auto-Paste blockiert)"
+  fi
+  notify "ezcpyssh ✅" "$remote_path"
+  printf '%s\n' "$remote_path"
+}
+
+# =====================================================================================
+# Hammerspoon-Konfiguration rendern + einbinden
+# =====================================================================================
+hotkey_lua() { # setzt MODS_OUT + KEY_OUT aus $HOTKEY ("cmd,shift,v")
+  local IFS=',' parts=() i n mods=()
+  read -ra parts <<< "$HOTKEY"
+  n=${#parts[@]}
+  KEY_OUT="${parts[$((n-1))]}"
+  for ((i=0;i<n-1;i++)); do mods+=("\"${parts[i]}\""); done
+  local joined; joined="$(IFS=', '; printf '%s' "${mods[*]}")"
+  MODS_OUT="{ $joined }"
+}
+list_lua() { # $1 comma-list -> { "a", "b" }
+  local IFS=',' items=() it out=()
+  read -ra items <<< "$1"
+  for it in "${items[@]}"; do out+=("\"$it\""); done
+  local joined; joined="$(IFS=', '; printf '%s' "${out[*]}")"
+  printf '{ %s }' "$joined"
+}
+
+render_lua() {
+  [ -f "$TEMPLATE" ] || { err "Template fehlt: $TEMPLATE"; return 1; }
+  local MODS_OUT KEY_OUT TERMS_OUT tmpl
+  hotkey_lua
+  TERMS_OUT="$(list_lua "$TERMINAL_APPS")"
+  tmpl="$(cat "$TEMPLATE")"
+  tmpl="${tmpl//@@EZCPYSSH@@/$BIN_LINK}"
+  tmpl="${tmpl//@@LOG@@/$HS_LOG}"
+  tmpl="${tmpl//@@MODS@@/$MODS_OUT}"
+  tmpl="${tmpl//@@KEY@@/$KEY_OUT}"
+  tmpl="${tmpl//@@TERMINALS@@/$TERMS_OUT}"
+  mkdir -p "$HS_DIR"
+  printf '%s\n' "$tmpl" > "$HS_LUA"
+}
+
+ensure_init_include() {
+  mkdir -p "$HS_DIR"
+  if [ -f "$HS_INIT" ] && grep -qF "$MARK_START" "$HS_INIT"; then return 0; fi
+  [ -f "$HS_INIT" ] && cp "$HS_INIT" "$HS_INIT.bak.$(date +%s)"
+  {
+    printf '%s\n' "$MARK_START"
+    printf '%s\n' 'dofile(os.getenv("HOME") .. "/.hammerspoon/ezcpyssh.lua")'
+    printf '%s\n' "$MARK_END"
+  } >> "$HS_INIT"
+}
+
+remove_init_include() {
+  [ -f "$HS_INIT" ] || return 0
+  grep -qF "$MARK_START" "$HS_INIT" || return 0
+  cp "$HS_INIT" "$HS_INIT.bak.$(date +%s)"
+  sed -i '' "/$MARK_START/,/$MARK_END/d" "$HS_INIT"
+}
+
+restart_hammerspoon() {
+  pkill -x Hammerspoon 2>/dev/null || true
+  sleep 1
+  open -a Hammerspoon 2>/dev/null || true
+}
+
+hammerspoon_installed() { [ -d "/Applications/Hammerspoon.app" ] || brew list --cask hammerspoon >/dev/null 2>&1; }
+
+# =====================================================================================
+# setup
+# =====================================================================================
+ssh_alias_hint() { # gibt eine kommagetrennte Liste nicht-Wildcard Host-Aliase
+  [ -f "$HOME/.ssh/config" ] || return 0
+  awk 'tolower($1)=="host"{for(i=2;i<=NF;i++) if($i !~ /[*?]/) print $i}' "$HOME/.ssh/config" \
+    | paste -sd, - 2>/dev/null
+}
+
+write_config() { # $1 target $2 remote_dir(literal) $3 hotkey $4 autopaste $5 terminals
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf '# ezcpyssh config — von `ezcpyssh setup/config` verwaltet\n'
+    printf 'SSH_TARGET="%s"\n' "$1"
+    printf "REMOTE_DIR='%s'\n" "$2"
+    printf 'HOTKEY="%s"\n' "$3"
+    printf 'AUTOPASTE=%s\n' "$4"
+    printf 'TERMINAL_APPS="%s"\n' "$5"
+  } > "$CONFIG"
+}
+
+link_bin() {
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$SELF_DIR/ezcpyssh" "$BIN_LINK"
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) : ;;
+    *) warn "~/.local/bin ist nicht im PATH — füge es in deiner Shell-Konfig hinzu." ;;
+  esac
+}
+
+cmd_setup() {
+  require_macos
+  local target="" remote_dir="" hotkey="" autopaste="" assume_yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --target) target="${2:-}"; shift 2 ;;
+      --remote-dir) remote_dir="${2:-}"; shift 2 ;;
+      --hotkey) hotkey="${2:-}"; shift 2 ;;
+      --no-autopaste) autopaste=0; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      *) err "Unbekannte Option: $1"; return 1 ;;
+    esac
+  done
+
+  printf '%sezcpyssh – Setup%s\n' "$C_OK" "$C_RST"
+  have brew || { err "Homebrew fehlt — installiere es von https://brew.sh und versuche es erneut."; return 1; }
+  ok "macOS / Homebrew gefunden"
+
+  load_config
+  remote_dir="${remote_dir:-$REMOTE_DIR}"
+  hotkey="${hotkey:-$HOTKEY}"
+  [ -n "$autopaste" ] || autopaste="$AUTOPASTE"
+  [ -n "$target" ] || target="$SSH_TARGET"
+
+  if [ -z "$target" ] && [ "$assume_yes" = 0 ]; then
+    local hint; hint="$(ssh_alias_hint)"
+    [ -n "$hint" ] && note "  bekannte SSH-Aliase: $hint"
+    printf 'SSH-Ziel (user@host): '
+    read -r target
+  fi
+  [ -n "$target" ] || { err "Kein SSH-Ziel. Nutze: ezcpyssh setup --target user@host"; return 1; }
+
+  printf '  → teste Verbindung … '
+  if ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" 'echo ok' >/dev/null 2>&1; then
+    ok "erreichbar"
+  else
+    printf '\n'; warn "nicht non-interaktiv erreichbar — prüfe Key-Auth/~/.ssh/config. Fahre fort."
+  fi
+
+  write_config "$target" "$remote_dir" "$hotkey" "$autopaste" "$TERMINAL_APPS"
+  ok "Config gespeichert ($CONFIG)"
+  link_bin
+  ok "ezcpyssh nach ~/.local/bin verlinkt"
+
+  if hammerspoon_installed; then
+    ok "Hammerspoon vorhanden"
+  else
+    if [ "$assume_yes" = 0 ]; then
+      printf 'Hammerspoon nicht gefunden. Installieren? [Y/n] '
+      local a; read -r a
+      case "$a" in [nN]*) err "Hammerspoon wird benötigt — abgebrochen."; return 1 ;; esac
+    fi
+    brew install --cask hammerspoon || { err "Hammerspoon-Installation fehlgeschlagen"; return 1; }
+    ok "Hammerspoon installiert"
+  fi
+
+  # frische Config laden, damit render_lua die neuen Werte nutzt
+  load_config
+  render_lua || return 1
+  ensure_init_include
+  ok "Hotkey-Konfig geschrieben (~/.hammerspoon/ezcpyssh.lua + init.lua)"
+  restart_hammerspoon
+  ok "Hammerspoon gestartet"
+
+  open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility" 2>/dev/null || true
+  printf '%s▶ Einmalige Freigabe:%s Aktiviere in den geöffneten Einstellungen den Schalter für „Hammerspoon".\n' "$C_WARN" "$C_RST"
+  if [ "$assume_yes" = 0 ]; then printf '   Danach [Enter] drücken … '; read -r _ || true; fi
+
+  echo; cmd_doctor || true
+  echo; ok "Fertig! Bild kopieren und ${HOTKEY//,/+} im SSH-Terminal drücken."
+}
+
+# =====================================================================================
+# doctor
+# =====================================================================================
+hs_accessibility() {
+  [ -f "$HS_LOG" ] || { printf 'unknown'; return; }
+  if grep 'accessibility=' "$HS_LOG" | tail -1 | grep -q 'accessibility=true'; then printf 'true'; else printf 'false'; fi
+}
+
+cmd_doctor() {
+  require_macos
+  load_config
+  local fails=0
+  ok "macOS $(sw_vers -productVersion 2>/dev/null)"
+
+  if [ -n "$SSH_TARGET" ]; then ok "Config ($SSH_TARGET, $REMOTE_DIR)"; else err "Config: kein SSH-Ziel — ezcpyssh setup"; fails=$((fails+1)); fi
+
+  if [ -n "$SSH_TARGET" ]; then
+    if ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_TARGET" 'echo ok' >/dev/null 2>&1; then ok "SSH erreichbar"; else warn "SSH nicht non-interaktiv erreichbar"; fi
+  fi
+
+  if hammerspoon_installed; then ok "Hammerspoon installiert"; else err "Hammerspoon fehlt"; fails=$((fails+1)); fi
+  if [ -f "$HS_LUA" ]; then ok "ezcpyssh.lua vorhanden"; else err "ezcpyssh.lua fehlt — ezcpyssh setup"; fails=$((fails+1)); fi
+  if [ -f "$HS_INIT" ] && grep -qF "$MARK_START" "$HS_INIT"; then ok "init.lua-Einbindung vorhanden"; else err "init.lua-Einbindung fehlt — ezcpyssh setup"; fails=$((fails+1)); fi
+
+  case "$(hs_accessibility)" in
+    true) ok "Accessibility-Freigabe aktiv" ;;
+    false) err "Accessibility-Freigabe fehlt — Hammerspoon in Systemeinstellungen aktivieren"; fails=$((fails+1)) ;;
+    *) warn "Accessibility-Status unbekannt (Hammerspoon noch nicht geladen?)" ;;
+  esac
+
+  if [ -x "$BIN_LINK" ]; then ok "ezcpyssh im PATH (~/.local/bin)"; else warn "ezcpyssh nicht in ~/.local/bin verlinkt"; fi
+
+  echo
+  if [ "$fails" -eq 0 ]; then ok "Alles gut."; else err "$fails Problem(e) gefunden."; return 1; fi
+}
+
+# =====================================================================================
+# config / uninstall / help / version
+# =====================================================================================
+cmd_config() {
+  local sub="${1:-get}"; shift || true
+  case "$sub" in
+    path) printf '%s\n' "$CONFIG" ;;
+    get)  [ -f "$CONFIG" ] && cat "$CONFIG" || { err "Keine Config — ezcpyssh setup"; return 1; } ;;
+    edit) "${EDITOR:-nano}" "$CONFIG"; _reapply_config ;;
+    set)
+      local key="${1:-}" val="${2:-}"
+      [ -n "$key" ] && [ $# -ge 2 ] || { err "Nutzung: ezcpyssh config set KEY VALUE"; return 1; }
+      load_config
+      case "$key" in
+        SSH_TARGET) SSH_TARGET="$val" ;;
+        REMOTE_DIR) REMOTE_DIR="$val" ;;
+        HOTKEY) HOTKEY="$val" ;;
+        AUTOPASTE) AUTOPASTE="$val" ;;
+        TERMINAL_APPS) TERMINAL_APPS="$val" ;;
+        *) err "Unbekannter Schlüssel: $key"; return 1 ;;
+      esac
+      write_config "$SSH_TARGET" "$REMOTE_DIR" "$HOTKEY" "$AUTOPASTE" "$TERMINAL_APPS"
+      _reapply_config
+      ok "$key gesetzt."
+      ;;
+    *) err "Unbekanntes Unterkommando: $sub"; return 1 ;;
+  esac
+}
+_reapply_config() {
+  load_config
+  if hammerspoon_installed; then render_lua && ensure_init_include && restart_hammerspoon && ok "Hammerspoon neu geladen"; fi
+}
+
+cmd_uninstall() {
+  remove_init_include && ok "init.lua-Einbindung entfernt"
+  [ -f "$HS_LUA" ] && rm -f "$HS_LUA" && ok "ezcpyssh.lua entfernt"
+  [ -L "$BIN_LINK" ] && rm -f "$BIN_LINK" && ok "Symlink entfernt"
+  if [ -f "$CONFIG" ]; then
+    printf 'Config löschen (%s)? [y/N] ' "$CONFIG"; local a; read -r a
+    case "$a" in [yY]*) rm -f "$CONFIG"; ok "Config entfernt" ;; *) note "Config behalten." ;; esac
+  fi
+  restart_hammerspoon || true
+  note "Hinweis: die Hammerspoon-App bleibt installiert (brew uninstall --cask hammerspoon zum Entfernen)."
+}
+
+cmd_help() {
+  cat <<EOF
+ezcpyssh $VERSION — Clipboard-Bilder per Hotkey in eine SSH-Remote-Session einfügen
+
+NUTZUNG
+  ezcpyssh setup [--target user@host] [--remote-dir DIR] [--hotkey cmd,shift,v] [--no-autopaste] [--yes]
+                 Richtet alles ein: Config, Hammerspoon (Auto-Install), Hotkey, Accessibility.
+  ezcpyssh send  Lädt das aktuelle Clipboard-Bild hoch und fügt den Remote-Pfad ein
+                 (das, was der Hotkey aufruft). Exit 2 = kein Bild, 1 = Upload-Fehler.
+  ezcpyssh doctor          Prüft Konfiguration, SSH, Hammerspoon, Accessibility, Hotkey.
+  ezcpyssh config get|set KEY VALUE|edit|path
+  ezcpyssh uninstall       Entfernt Hotkey/Config (Hammerspoon-App bleibt).
+  ezcpyssh help | version
+
+So funktioniert's: Bild kopieren (⌘C) → im Terminal Hotkey drücken → ezcpyssh lädt das Bild
+auf den SSH-Server, der Remote-Pfad wird eingefügt; das Remote-Programm (z. B. Claude Code)
+hängt das Bild daraus an. Mehr: https://github.com/sxty9/ezcpyssh
+EOF
+}
+
+# =====================================================================================
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    setup) cmd_setup "$@" ;;
+    send) cmd_send "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    config) cmd_config "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    version|--version|-v) printf 'ezcpyssh %s\n' "$VERSION" ;;
+    help|--help|-h) cmd_help ;;
+    *) err "Unbekanntes Kommando: $cmd"; echo; cmd_help; return 1 ;;
+  esac
+}
+main "$@"

@@ -1,0 +1,72 @@
+-- ezcpyssh — von `ezcpyssh setup` generiert. Nicht von Hand editieren;
+-- nutze `ezcpyssh config set …`. Wird aus ~/.hammerspoon/init.lua per dofile geladen.
+--
+-- Hotkey-Verhalten:
+--   * Terminal im Vordergrund UND Bild im Clipboard
+--       -> `ezcpyssh send` lädt das Bild zum SSH-Server, dann wird der Remote-Pfad
+--          eingefügt (das Remote-Programm, z. B. Claude Code, hängt das Bild daraus an).
+--   * sonst -> der Hotkey wird normal an die App durchgereicht.
+
+require("hs.ipc") -- erlaubt Steuerung/Debugging über das `hs` Terminal-Kommando
+
+local EZCPYSSH = "@@EZCPYSSH@@"
+local LOG = "@@LOG@@"
+local MODS = @@MODS@@
+local KEY = "@@KEY@@"
+local TERMINALS = @@TERMINALS@@
+
+local function log(msg)
+  local f = io.open(LOG, "a")
+  if f then f:write(os.date("%H:%M:%S") .. "  " .. msg .. "\n"); f:close() end
+end
+
+local hk -- vorwärts deklariert
+
+-- Tastendruck senden, ohne den eigenen Hotkey erneut auszulösen
+local function sendKey(mods, key)
+  hk:disable()
+  hs.eventtap.keyStroke(mods, key, 0)
+  hs.timer.doAfter(0.05, function() hk:enable() end)
+end
+
+local function isTerminal(name)
+  for _, n in ipairs(TERMINALS) do if n == name then return true end end
+  return false
+end
+
+local function handler()
+  local app = hs.application.frontmostApplication()
+  local name = app and app:name() or ""
+  local hasImage = hs.pasteboard.readImage() ~= nil
+  log("hotkey: app=" .. name .. " image=" .. tostring(hasImage))
+
+  if not (isTerminal(name) and hasImage) then
+    sendKey(MODS, KEY) -- kein Terminal/kein Bild -> Hotkey normal durchreichen
+    return
+  end
+
+  hs.alert.show("⬆︎ Bild → Server …", 0.7)
+  local t = hs.task.new(EZCPYSSH, function(rc)
+    log("ezcpyssh send rc=" .. tostring(rc))
+    if rc == 0 then
+      hs.timer.doAfter(0.05, function() sendKey({ "cmd" }, "v") end)
+    elseif rc == 2 then
+      hs.alert.show("Kein Bild im Clipboard")
+    else
+      hs.alert.show("ezcpyssh: Upload fehlgeschlagen")
+    end
+  end, { "send" })
+  -- setEnvironment ersetzt die komplette Umgebung -> HOME/PATH mitgeben.
+  -- EZCPYSSH_AUTOPASTE=0: `send` lädt nur hoch + legt den Pfad ins Clipboard;
+  -- das Einfügen macht Hammerspoon (zuverlässig, ohne Hänger).
+  t:setEnvironment({
+    EZCPYSSH_AUTOPASTE = "0",
+    HOME = os.getenv("HOME"),
+    PATH = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+  })
+  t:start()
+end
+
+hk = hs.hotkey.bind(MODS, KEY, handler)
+log("config geladen, accessibility=" .. tostring(hs.accessibilityState()) .. ", hotkeys=" .. tostring(#hs.hotkey.getHotkeys()))
+hs.alert.show("ezcpyssh bereit")
