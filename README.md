@@ -1,18 +1,18 @@
 # ezcpyssh
 
-**Paste a Mac‑clipboard image straight into a remote program over SSH — as if the SSH boundary weren't there.**
+**Paste a clipboard image straight into a remote program over SSH — on macOS or Windows — as if the SSH boundary weren't there.**
 
 When you SSH into a server and run something like **Claude Code** in the terminal, you can't paste
 an image: SSH terminals don't carry clipboard images, and the remote program only sees the (empty)
 server clipboard. `ezcpyssh` fixes that with a single hotkey.
 
-Press your hotkey (default **⌘⇧V**) in the terminal and ezcpyssh:
+Press your hotkey (**⌘⇧V** on macOS, **Ctrl+Alt+V** on Windows) in the terminal and ezcpyssh:
 
-1. grabs the image from your Mac clipboard,
+1. grabs the image from your local clipboard,
 2. uploads it over your existing SSH connection,
 3. pastes the **remote file path** — which the remote program reads as a local image.
 
-Copy → ⌘⇧V → image attached. That's it.
+Copy → hotkey → image attached. That's it. ([macOS](#install) · [Windows](#windows))
 
 ---
 
