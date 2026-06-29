@@ -1,0 +1,82 @@
+; ezcpyssh — von `ezcpyssh setup` generiert. Nicht von Hand editieren;
+; nutze `ezcpyssh config set ...`. Wird beim Login per Autostart-Verknuepfung geladen.
+;
+; Hotkey-Verhalten:
+;   * Terminal im Vordergrund UND Bild im Clipboard
+;       -> `ezcpyssh send` laedt das Bild zum SSH-Server, dann wird der Remote-Pfad
+;          eingefuegt (das Remote-Programm, z. B. Claude Code, haengt das Bild daraus an).
+;   * sonst -> der Hotkey wird normal an die App durchgereicht.
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+
+EZCPYSSH := "@@PSSCRIPT@@"
+EZ_LOG := "@@LOG@@"               ; nicht "LOG" — das ist in AHK v2 die eingebaute Log()-Funktion
+TERMINALS := "@@TERMINALS@@"
+
+logmsg(msg) {
+    global EZ_LOG
+    try FileAppend(FormatTime(, "HH:mm:ss") . "  " . msg . "`n", EZ_LOG)
+}
+
+; Vordergrund-App ist ein Terminal?
+terminalActive() {
+    global TERMINALS
+    try {
+        exe := WinGetProcessName("A")
+    } catch {
+        return false
+    }
+    for name in StrSplit(TERMINALS, ",") {
+        if (StrLower(Trim(name)) == StrLower(exe))
+            return true
+    }
+    return false
+}
+
+; Liegt ein Bild im Clipboard? (CF_DIB=8, CF_BITMAP=2)
+clipboardHasImage() {
+    if DllCall("IsClipboardFormatAvailable", "uint", 8)
+        return true
+    if DllCall("IsClipboardFormatAvailable", "uint", 2)
+        return true
+    return false
+}
+
+; Hotkey nur aktiv, wenn ein Terminal im Vordergrund ist.
+#HotIf terminalActive()
+@@HOTKEY@@::ezHandler()
+#HotIf
+
+ezHandler() {
+    global EZCPYSSH
+    if !clipboardHasImage() {
+        ; kein Bild -> Hotkey normal durchreichen (loest sich selbst nicht erneut aus)
+        logmsg("hotkey: kein Bild -> passthrough")
+        Send("@@SENDKEY@@")
+        return
+    }
+    logmsg("hotkey: Bild gefunden -> upload")
+    ToolTip("ezcpyssh: Bild -> Server ...")
+
+    ; EZCPYSSH_AUTOPASTE=0: `send` laedt nur hoch + legt den Pfad ins Clipboard;
+    ; das Einfuegen macht AutoHotkey (zuverlaessig, ohne Haenger).
+    EnvSet("EZCPYSSH_AUTOPASTE", "0")
+    rc := RunWait('powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "' EZCPYSSH '" send', , "Hide")
+    ToolTip()
+    logmsg("ezcpyssh send rc=" . rc)
+
+    if (rc == 0) {
+        Sleep(60)
+        Send("^v")            ; Remote-Pfad einfuegen (Windows Terminal: Strg+V)
+    } else if (rc == 2) {
+        ToolTip("Kein Bild im Clipboard")
+        SetTimer(() => ToolTip(), -1200)
+    } else {
+        ToolTip("ezcpyssh: Upload fehlgeschlagen")
+        SetTimer(() => ToolTip(), -1500)
+    }
+}
+
+logmsg("config geladen, hotkey=@@HOTKEY@@")
+ToolTip("ezcpyssh bereit")
+SetTimer(() => ToolTip(), -1000)

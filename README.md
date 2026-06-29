@@ -54,6 +54,49 @@ Fully non‑interactive: `ezcpyssh setup --target you@your-server --yes`
 2. Switch to your terminal where the remote program runs.
 3. Press **⌘⇧V**.
 
+---
+
+## Windows
+
+The same idea works on Windows using native tooling — **PowerShell** for the clipboard +
+upload, and **AutoHotkey v2** for the global hotkey (the Hammerspoon equivalent).
+
+**Install (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/sxty9/ezcpyssh/main/install.ps1 | iex
+```
+
+**Or clone:**
+
+```powershell
+git clone https://github.com/sxty9/ezcpyssh "$env:USERPROFILE\ezcpyssh"
+powershell -STA -ExecutionPolicy Bypass -File "$env:USERPROFILE\ezcpyssh\bin\ezcpyssh.ps1" setup
+```
+
+Setup asks for your SSH target, installs AutoHotkey v2 (via `winget` if missing), writes the
+hotkey script, and registers it for autostart. Non‑interactive:
+`ezcpyssh.ps1 setup --target you@your-server --yes`.
+
+**Usage:** copy an image (`Ctrl+C`, or the Snipping Tool) → in your terminal press the hotkey
+(default **Ctrl+Alt+V**) → the image uploads and the remote path is pasted with `Ctrl+V`.
+
+**Commands** mirror the macOS CLI: `setup`, `send`, `doctor`, `config get|set|edit|path`,
+`uninstall`, `help`, `version` — run via `powershell -File bin\ezcpyssh.ps1 <command>`.
+
+**Windows requirements:**
+
+- Windows 10/11 with the built‑in **OpenSSH client** (`ssh`, on `PATH` by default).
+- **AutoHotkey v2** (auto‑installed via `winget`, or from <https://www.autohotkey.com/>).
+- **Windows Terminal** (recommended) — its default paste binding is `Ctrl+V`, which is what the
+  hotkey sends. If your terminal pastes with a different key, set it as your terminal's paste
+  binding or change which window class is treated as a terminal.
+- An **SSH server reachable with key auth** (uses your `~/.ssh/config`). Keep `REMOTE_DIR`
+  free of spaces (default `$HOME/.cache/ezcpyssh`, expanded server‑side).
+
+Config lives at `%APPDATA%\ezcpyssh\config`; the generated hotkey script and debug log are in
+the same folder.
+
 ## Requirements
 
 - **macOS** (uses native clipboard + Hammerspoon for the hotkey).
